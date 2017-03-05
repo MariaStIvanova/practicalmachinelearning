@@ -1,0 +1,179 @@
+---
+title: "Practical Machine Learning Course Project"
+author: "Maria St Ivanova"
+date: '5 март 2017 г '
+output: html_document
+---
+
+# Introduction 
+
+Using devices such as Jawbone Up, Nike FuelBand, and Fitbit it is now possible to collect a large amount of data about personal activity relatively inexpensively. These type of devices are part of the quantified self movement. One thing that people regularly do is quantify how much of a particular activity they do, but they rarely quantify how well they do it. 
+
+In this project, my goal will be to use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants. They were asked to perform barbell lifts correctly and incorrectly in 5 different ways. More information is available from the website here: <http://groupware.les.inf.puc-rio.br/har>. The goal of my project is to predict the manner in which they did the exercise. 
+
+# Load the data sets 
+
+From the Course Project Instructions I do not understand if my R code should be visible but I prefer to let the readers see it. 
+
+```{r load data, message=FALSE, cache=TRUE, include=FALSE}
+library(caret)
+library(randomForest)
+library(e1071)
+library(gbm)
+library(MASS)
+library(lattice)
+library(ggplot2)
+library(survival)
+library(splines)
+library(parallel)
+library(plyr)
+path <- getwd() 
+if(!file.exists("./data")){dir.create("./data")}
+url1 <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+url2 <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv" 
+filename1 <- "pml-training.csv"
+filename2 <- "pml-testing.csv" 
+download.file(url1, file.path(path, "data", filename1))
+download.file(url2, file.path(path, "data", filename2)) 
+trainset <- read.csv(file.path(path, "data", "pml-training.csv"), na.strings=c('#DIV/0', '', 'NA', '#DIV/0!'))
+testset <- read.csv(file.path(path, "data", "pml-testing.csv"), na.strings=c('#DIV/0', '', 'NA', '#DIV/0!'))
+```
+
+The data sets contain a lot of variables (160 variables, some with missing values) so I will not explore them one by one in details. Just viewing the first few and the last few variables reveals that the first 7 variables are not related to movement so I will delete them, and the last variable is the dependent variable *classe*. 
+ 
+
+```{r, echo=TRUE}
+dim(trainset)
+head(trainset[, 1:10], n = 2)
+head(trainset[, 155:160], n = 2)
+sum(apply(apply(trainset, 2, is.na), 2, sum)) # checks if any missing values
+sum(apply(apply(testset, 2, is.na), 2, sum))
+```
+
+The variable of interest *classe* is a factor variable with 5 classes: A, B, c, D, E. They are almost equally represented, only category A is a bit more frequent. The algorithms that are suitable for prediction of categorical variables are trees, random forest and linear discriminant analysis. Later in the analysis I will use them, first some data preprocessing will be necessary. 
+
+```{r, echo=TRUE}
+train153 <- trainset[, -c(1:7)]
+test153 <- testset[, -c(1:7)]
+head(train153$classe)
+table(train153$classe)
+```
+
+# Data preprocessing
+
+The standard preprocessing, in mu opinion, includes making sure that the variables are indicated with the correct variable type (measurement scale), that there are no missing values, the there are no severely correlated variables if we are about the run regression analyses, that the variables are not extremely skewed or with almost zero variance. 
+
+## Variable types 
+
+I plan to use the preProcess function from the caret package. From the help file we know that "Non-numeric data will not be pre-processed and their values will be in the data frame produced by the predict function." So I want all 152 potential predictors to be numeric and the *classe* variable to be treated as categorical.  
+
+```{r as numeric, echo=TRUE}
+train153num <- train153
+for (i in 1:152) {train153num[, i] <- as.numeric(train153[, i])}
+test153num <- test153
+for (i in 1:152) {test153num[, i] <- as.numeric(test153[, i])}
+rm(train153, test153)
+```
+
+## Missing data
+
+I think that if the data set contains variables with too many missing values (more than 30% is considered too many), then the knn imputation algorithm will not work properly. I want to see in what proportions the missing values come. 
+
+```{r rm how many NA, echo=TRUE}
+numNA <- vector(mode = "numeric", length = 152)
+for (i in 1:152) {numNA[i] <- sum(is.na(train153num[,i]))}
+unique(numNA)
+```
+
+There are two types of variables: one with no missing values, and another one with too many missing values (more than 19 thousand). This case does not provide good ground for imputation so I will delete all variables with missing values. The resulting data sets have 53 columns, or 52 potential predictors. 
+
+```{r keep full vars, echo=TRUE}
+vars_noNA <- numNA == 0
+trainnoNA <- train153num[, vars_noNA]
+testnoNA <- test153num[, vars_noNA]
+rm(train153num, test153num)
+dim(trainnoNA)
+```
+
+## Multicorrelation 
+
+Some of the variables (33 out of 52) are highly correlated with each other.
+
+```{r corr, echo=TRUE}
+corMat <- abs(cor(trainnoNA[, 1:52]))
+diag(corMat) <- 0 
+length(unique(which(corMat > 0.75, arr.ind = TRUE)[,1]))
+```
+
+If I remove them, I would like to check how the remaining magnitude of multicollinearity would affect the VIFs in a regression type of analysis: 
+
+```{r VIFs, echo=TRUE}
+library(car)
+tempcol <- unique(which(corMat > 0.75, arr.ind = TRUE)[,1])
+tempdt <- trainnoNA[, -tempcol]
+set.seed(1234)
+tempy <- rnorm(n=19622)
+tempdt$y <- tempy
+tempmod <- lm(y ~ . , data = tempdt[, -20]) 
+summary(vif(tempmod))
+rm(tempdt, tempy, tempmod, tempcol)
+```
+
+The VIFs are acceptable (max VIF < 5) but I would have to give up 33 variables and keep only 19. I could either do this (remove highly correlated variables), or apply Principle Component Analysis (PCA). As a first try, I prefer to keep the original variables. This helps later with interpretability and it is in general cheaper to collect 19 variables than 52. If we cannot build a satisfactory model with the fewer original variables, I will return to the preprocessing step and use PCA. 
+
+If I use *tempcol* as an indicator which variables to remove, I would remove too many variables. If A and B are highly correlated, we don not have to throw away both, only one of them is enough. So I will use the function *findCorrlation* to identify and remove variables and my criterion for removal will be again max VIF < 5. After a few trials I came up with cutoff point of 0.65 for the correlation matrix. 
+
+```{r findCorr, echo=TRUE, message=FALSE}
+library(caret)
+highCorr <- findCorrelation(x=corMat, cutoff = 0.65)
+set.seed(1234)
+tempdt <- trainnoNA[, -highCorr]
+tempy <- rnorm(n=19622)
+tempdt$y <- tempy
+n <- length(names(tempdt))
+tempmod <- lm(y ~ . , data = tempdt[, -(n-1)]) 
+summary(vif(tempmod))
+rm(n, tempdt, tempy, tempmod)
+```
+
+
+## The preProcess function 
+
+First I remove the unacceptably correlated variables and then I remove those which (eventually) have near zero variances and finally I standardize the rest. 
+
+```{r preprocess, echo=TRUE}
+train4PP <- trainnoNA[ , -highCorr]
+test4PP <- testnoNA[ , -highCorr]
+rm(highCorr)
+preProc1 <- preProcess(train4PP, method = c("center", "scale", "nzv"), na.remove = TRUE)
+train4mod <- predict(preProc1, newdata = train4PP)
+test4mod <- predict(preProc1, newdata = test4PP)
+```
+
+# Algorithms 
+
+Decided on the class of the dependent variable, I will use three studied classification algorithms, namely linear discriminant analysis, random forest, and a boosted tree. 
+
+## Cross-validation 
+
+The cross-validation that I would like to set is of the type *random sampling* where 80% of the rows of the cleaned train set are left as actual train set and the rest 20% of it are used for testing of the model. This is done 25 times. Then the algorithm chooses the best model based on the metric that has to be optimized. In the case of classification this is the metric *Accuracy*. 
+
+```{r models, echo=TRUE, cache=TRUE}
+set.seed(1234)
+control <- trainControl(method="LGOCV", p = 0.80)
+modFitLDA <- train(classe ~ ., method = "lda", data = train4mod, trControl=control)
+modFitRF <- train(classe ~ ., method = "rf", data = train4mod, trControl=control)
+modFitBT <- train(classe ~ ., method = "gbm", data = train4mod, trControl=control, verbose = FALSE)
+```
+
+## Accuracy 
+
+Random forest brings the highest accuracy - 0.988, - followed by Boosted Tree with accuracy of 0.902, and at the end of the list is LDA with accuracy of 0.559.   
+
+```{r accuracies, echo=TRUE}
+modFitLDA
+modFitRF
+modFitBT
+```
+
+I think the expected out-of-sample error will be a bit bigger in the testing set. In other words, the accuracy will be a bit lower but no more than 2-3 percentage points. 
